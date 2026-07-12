@@ -147,6 +147,74 @@ db.close()
 
 Should print `[('portfolio',), ('transactions',), ('users',)]`. If this fails, see Troubleshooting below.
 
+> **Backend-only for now?** Steps 5 and 6 (the database) are only needed to run the *real* database layer. Member 1 can build and test the entire `backend/` without MySQL at all — it runs against an in-memory stub. See the next section.
+
+---
+
+## Backend setup & how to run it (Member 1)
+
+The `backend/` folder (`price_engine.py`, `trade_engine.py`, `news_engine.py`)
+does **not** need MySQL, a `.env`, or the frontend to run and be tested. It
+only needs the Python packages from Step 2 (`numpy`, `requests`). Until
+Member 2's real `db/` package exists, `trade_engine.py` automatically falls
+back to `backend/db_stub.py`, an in-memory fake database.
+
+### One-time setup
+
+Just Step 2 above (create the venv and `pip install -r requirements.txt`). No
+`.env` is required to fetch prices — `config.py` defaults to CoinGecko's free
+public endpoint, which needs no API key.
+
+### Running the backend self-tests
+
+Every backend file has a built-in test at the bottom
+(`if __name__ == "__main__":`). Run them **from the project root** with the
+venv's Python and the `-m` flag (so the `backend.` imports resolve):
+
+```bash
+# Live prices from CoinGecko + the boosted/volatility engine
+./venv/bin/python -m backend.price_engine
+
+# Full buy/sell cycle against the stub database (rejections + a buy/buy/sell)
+./venv/bin/python -m backend.trade_engine
+
+# Fake-news generator + the 3-call price-impact decay
+./venv/bin/python -m backend.news_engine
+
+# The in-memory stub database on its own
+./venv/bin/python -m backend.db_stub
+```
+
+Prefer activating the venv once? Then plain `python` works:
+
+```bash
+source venv/bin/activate          # Windows: venv\Scripts\activate
+python -m backend.price_engine
+```
+
+### What "working" looks like
+
+- `price_engine` prints real prices (e.g. `BTC: 64308.0`) and boosted prices
+  that swing noticeably more than the real ones.
+- `trade_engine` prints five rejected trades (bad action/coin, zero quantity,
+  too-big buy, selling nothing owned) followed by a successful buy/buy/sell,
+  with a correct weighted-average buy price after the two buys.
+- `news_engine` prints sample events and shows an impact holding for exactly
+  3 calls, then dropping to `0.0`.
+
+If `price_engine` prints `CoinGecko fetch failed: ...`, your machine can't
+reach the API right now (offline / rate-limited) — the code handles it
+gracefully; just retry in a moment.
+
+### When Member 2 delivers the real `db/`
+
+1. Do Steps 3–6 above (create `.env`, run `schema.sql`, smoke-test the
+   MySQL connection).
+2. Delete `backend/db_stub.py`.
+3. Re-run `./venv/bin/python -m backend.trade_engine` — it now writes to the
+   real MySQL database instead of the stub. (Member 2 also needs to add
+   `get_user_by_id(userid)` to `db/users_db.py` — see `BACKEND_GUIDE.md`.)
+
 ---
 
 ## Step 7 — Run the app
