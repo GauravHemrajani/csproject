@@ -1,6 +1,6 @@
 # CryptoRisk — INTERFACES.md
 
-**Status: LOCKED.** This is the single contract for every function that crosses a module boundary (one person calls it, another person implements it). Build against these signatures with stub/mock functions from day one — don't wait for the real implementation.
+**Status: LOCKED.** This is the single contract for every function that crosses a module boundary (one person calls it, another person implements it). All modules now build against the real implementations — the database layer lives in `db/`.
 
 **Ground rule:** once locked, nobody changes a function's name, parameters, or return type without telling the whole group immediately. A silent change here is the #1 way this project breaks during integration in week 3–4.
 
@@ -42,23 +42,30 @@ Checks username uniqueness internally before inserting.
 Returns `None` if username not found.
 **This is also the login function.** Frontend calls this, then compares `result["password"] == entered_password` itself (plaintext, per PRD — no hashing).
 
-### `update_balance(userid: int, new_balance: float) -> bool`
+### `get_user_by_id(userid: int, conn=None, for_update=False) -> dict | None`
+Same return shape as `get_user()`, but looked up by `userid`. Returns `None` if the id doesn't exist. This is what `execute_trade()` uses to read the current balance.
+**`conn` (optional):** the read joins the caller's open connection/transaction instead of opening (and closing) its own — the caller owns commit/rollback and close.
+**`for_update` (optional):** appends `FOR UPDATE` to the SELECT, locking this user's row until the caller commits or rolls back. `execute_trade()` passes both (`conn=`, `for_update=True`) so that two simultaneous trades for the same user can't both read the same stale balance — the second one waits for the first to commit, then sees the fresh value. Standalone calls (defaults) behave exactly as before.
+
+### `update_balance(userid: int, new_balance: float, conn=None) -> bool`
 Sets balance to the given absolute value (not a delta — caller computes the new balance first).
 Returns `True` on success, `False` if `userid` doesn't exist or the update fails.
+**`conn` (optional):** when the caller passes an open `mysql.connector` connection, the write runs on that connection **without committing or closing it** — the caller owns the commit/rollback. Standalone calls (no `conn`) behave exactly as before. Same rule for `upsert_holding()` and `insert_transaction()` below. `execute_trade()` uses this to make its three writes atomic.
 
-### `get_portfolio(userid: int) -> list[dict]`
+### `get_portfolio(userid: int, conn=None) -> list[dict]`
 **Returns:**
 ```python
 [{"coin": str, "quantity": float, "buy_price": float}, ...]
 ```
 Returns `[]` if the user holds nothing. One row per coin (composite key `(userid, coin)`).
+**`conn` (optional):** the read joins the caller's open connection/transaction (no close) — `execute_trade()` passes it so the holdings are read on the same connection that holds the user-row lock. Standalone calls behave exactly as before.
 
-### `upsert_holding(userid: int, coin: str, quantity: float, buy_price: float) -> bool`
+### `upsert_holding(userid: int, coin: str, quantity: float, buy_price: float, conn=None) -> bool`
 `quantity` is the **new total** quantity after the trade (not a delta). `buy_price` is the recalculated weighted average (for buys) or the unchanged existing average (for sells) — Member 1 computes this before calling.
 **Built-in rule:** if `quantity <= 0` (full sell), this function **deletes** the row rather than leaving a zero-quantity row behind. Backend never needs a separate delete call.
 Returns `True` on success, `False` on failure.
 
-### `insert_transaction(userid: int, coin: str, action: str, quantity: float, price: float, trade_date: date) -> int | None`
+### `insert_transaction(userid: int, coin: str, action: str, quantity: float, price: float, trade_date: date, conn=None) -> int | None`
 `action` is `"BUY"` or `"SELL"`.
 **ID generation is manual:** this function runs `SELECT COALESCE(MAX(transid), 0) + 1 FROM transactions` to compute the next `transid`, then inserts explicitly with that value and returns it.
 **Date handling:** callers always pass a real `date` object. `schema.sql` declares `trade_date` as a native `DATE` column, so `mysql.connector` handles the conversion automatically — no manual string formatting needed on either side.
@@ -98,13 +105,15 @@ Batch version — one throttled call instead of Member 3 calling `get_live_price
 }
 ```
 `real_change_pct` is computed against the previous fetch (baseline cached internally in `price_engine.py` — a plain module-level variable, **not** `st.session_state`; `backend/` never imports `streamlit`. This baseline is shared across all users, since the whole app simulates one common market, not a separate market per user); on the very first call after the app starts it's `0.0`. **This cache does not persist across app restarts** — restarting the app resets `real_change_pct` to `0.0` on the next call and the price history buffer (see below) starts empty again; this is expected and requires no extra handling.
-`boosted_change_pct = (real_change_pct * 5) + np.random.normal(0, 3) + apply_news_impact(coin)`.
+`boosted_change_pct = (real_change_pct * 5) + np.random.normal(0, 3) + apply_news_impact(coin)`, then **floor-clamped (locked):** `boosted_change_pct = max(boosted_change_pct, -95.0)`. Without this floor, a big real crash amplified 5x plus a bad-news hit could push `boosted_change_pct` below -100%, making `boosted_price` negative — which would let a BUY slip past the balance check and hand the user free cash. `execute_trade()` also independently rejects `boosted_price <= 0` as defense in depth (see below).
 
 **`boosted_price` formula (locked):**
 ```
 boosted_price = real_price * (1 + boosted_change_pct / 100)
 ```
 `boosted_price` is always computed fresh off the **current** `real_price` on every call — it is never compounded off the previous call's `boosted_price`. This keeps the boosted price anchored to reality: a single extreme swing (from a big news hit or a high `np.random.normal` draw) affects that one tick's displayed price but cannot permanently drag the series away from where real prices actually are.
+
+**Per-coin tick cache (locked):** a fresh snapshot is computed at most once every `BOOSTED_TICK_SECONDS` (3 seconds) per coin. Any call for that coin within the window returns a **copy** of the same cached snapshot instead of re-rolling `np.random.normal` or re-consuming news impact — every caller (a dashboard render, a trade fired moments later) sees the identical boosted price within a tick, so a user always trades at the price they were just shown. Only a freshly-computed tick appends to the price-history buffer described below; a cache-hit call does not create a duplicate history point.
 
 **Returns `None` in two cases (locked):** (1) `coin` is invalid, or (2) the underlying `get_live_price(coin)` call itself returned `None` (CoinGecko fetch failed/timed out) — `get_boosted_price()` must not attempt to compute a boosted value off a missing real price. There is no way for a caller to tell these two cases apart from the return value alone (same "bare `None`, don't crash" convention used everywhere else in this doc) — Member 3 and `execute_trade()` both just need to treat any `None` here as "price unavailable right now, show/handle accordingly."
 This is the function Member 3 uses to plot "real vs boosted" side by side.
@@ -124,8 +133,14 @@ Ordered oldest → newest (natural order for a time-series line chart). Returns 
 ```python
 {"success": bool, "message": str, "executed_price": float | None, "new_balance": float | None}
 ```
-Failure cases (`success: False`, `executed_price`/`new_balance`: `None`): `get_boosted_price(coin)` returned `None` (price temporarily unavailable, e.g. CoinGecko fetch failed — **check this first**, before any balance/quantity math, since there's no price to validate a trade against), insufficient balance (BUY), insufficient quantity owned (SELL), invalid coin, `quantity <= 0`. `message` says which.
-Internally: fetches boosted price → calls `db.get_user()` for current balance and `db.get_portfolio()` for current holdings/avg price → validates → computes weighted avg buy price (see below, for BUYs) → calls `db.update_balance()`, `db.upsert_holding()`, `db.insert_transaction()`.
+Failure cases (`success: False`, `executed_price`/`new_balance`: `None`): `get_boosted_price(coin)` returned `None` (price temporarily unavailable, e.g. CoinGecko fetch failed — **check this first**, before any balance/quantity math, since there's no price to validate a trade against), invalid coin, `quantity` is not a real finite number (`str`, `None`, `bool`, `NaN`, `inf` → checked **before** the `<= 0` check, since `NaN` compares `False` to every numeric comparison and would otherwise slip through), `quantity <= 0`, `boosted_price <= 0` (defense in depth — should be unreachable given the price floor above, but never trade against a non-positive price), insufficient balance (BUY), insufficient quantity owned (SELL). `message` says which.
+Internally: fetches boosted price → opens ONE db connection → calls `get_user_by_id(userid, conn=conn, for_update=True)` for the current balance (locking the user's row) and `get_portfolio(userid, conn=conn)` for current holdings/avg price → validates → computes weighted avg buy price (see below, for BUYs) → calls `db.update_balance()`, `db.upsert_holding()`, `db.insert_transaction()` on that same connection → single `conn.commit()`.
+
+**Balance rounding (locked):** the cash balance written back via `update_balance()` is rounded to 2 decimals (`round(new_balance, 2)`) on every trade, for both BUY and SELL — cash is always whole cents, so binary-float dust can't slowly accumulate across many trades. Coin **quantities** keep full float precision (only cash is snapped).
+
+**Write ordering & atomicity (locked):** the three DB writes run in this order: `update_balance()` → `upsert_holding()` → `insert_transaction()`, all on **one shared connection** (each is passed `conn=` by `execute_trade()`), with a single `conn.commit()` after all three succeed. If any write fails, `execute_trade()` calls `conn.rollback()` and nothing lands — a trade is all-or-nothing even if the process dies mid-trade (MySQL discards uncommitted work when the connection drops). This uses only `mysql.connector`'s `conn.commit()`/`conn.rollback()` methods — the same Python API every `db/` function already uses — and **no SQL transaction statements** (`BEGIN`/`ROLLBACK`/`COMMIT` stay off-limits per `CryptoRisk_Project_Summary.md`'s CBSE constraints).
+
+**Concurrency safety (locked):** the balance read at the start of the trade uses `SELECT ... FOR UPDATE` on the same connection as the writes, which locks that user's row for the duration of the trade. If two trades for the same user arrive at the same instant (double-click, two tabs), the second blocks until the first commits, then reads the **updated** balance — so both can never spend the same money. The lock is released by the trade's final `conn.commit()` (or `conn.rollback()` on any failure/rejection). No explicit lock/transaction SQL is used beyond the `FOR UPDATE` clause on the SELECT.
 
 ### `calculate_weighted_avg_buy_price(existing_qty: float, existing_avg_price: float, new_qty: float, new_price: float) -> float`
 Internal helper — not called across the module boundary, but documented since Member 3 may want to reproduce the math for P/L tooltips on the portfolio page.

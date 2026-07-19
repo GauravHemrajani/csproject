@@ -46,6 +46,18 @@ from backend.constants import COIN_ID_MAP, SUPPORTED_COINS
 # users or Streamlit page-refreshes are hitting the app at once.
 CACHE_SECONDS = 30
 
+# The boosted price is recomputed at most once per BOOSTED_TICK_SECONDS per coin
+# (see _boosted_cache below). Within a tick every caller — the dashboard AND
+# execute_trade — gets the SAME boosted snapshot, so a user always trades at the
+# price they were shown.
+BOOSTED_TICK_SECONDS = 3
+
+# Floor on the amplified % change so the boosted price can crash hard but never
+# to zero or negative. A -95% swing is already brutal; this just stops the 5x
+# amplification (plus bad news) from driving boosted_price <= 0, which would let
+# a BUY pass the balance check and ADD cash.
+BOOSTED_CHANGE_FLOOR = -95.0
+
 # ---------------------------------------------------------------------------
 # Shared module-level state.
 # These are plain module variables (NOT st.session_state) because the whole
@@ -63,6 +75,7 @@ _baseline_real_price = {}  # coin -> real price the current change is measured f
 _last_real_change = {}     # coin -> last computed real_change_pct (persists across a window)
 _price_history = {}     # coin -> list of {"real_price", "boosted_price", "timestamp"}
 _MAX_HISTORY = 200      # cap history per coin so memory can't grow forever
+_boosted_cache = {}     # coin -> last boosted snapshot (one shared tick per coin)
 
 
 def _is_cache_fresh(coin):
@@ -177,6 +190,15 @@ def get_boosted_price(coin):
     """
     if coin not in COIN_ID_MAP:
         return None
+
+    # Serve the current tick if it's still fresh: within BOOSTED_TICK_SECONDS every
+    # caller sees the SAME boosted price. This is why the dashboard and a trade fired
+    # moments later agree — get_boosted_price no longer re-rolls the random noise (or
+    # re-consumes the news impact) on every single call.
+    cached = _boosted_cache.get(coin)
+    if cached is not None and (datetime.now() - cached["timestamp"]).total_seconds() < BOOSTED_TICK_SECONDS:
+        return dict(cached)                  # copy so callers can't mutate the cache
+
     real_price = get_live_price(coin)
     if real_price is None:
         return None                          # CoinGecko down — bail out cleanly
@@ -206,6 +228,11 @@ def get_boosted_price(coin):
         + np.random.normal(0, 3)             # NumPy: random number, mean 0, sd 3
         + apply_news_impact(coin)            # 0.0 if no active news
     )
+    # Floor the amplified move so the price stays strictly positive. Without this,
+    # a big real crash (x5) plus bad news can push boosted_change_pct below -100%,
+    # making boosted_price negative — which lets a BUY slip past the balance check
+    # and hand the user free cash.
+    boosted_change_pct = max(boosted_change_pct, BOOSTED_CHANGE_FLOOR)
     # Boosted price is ALWAYS computed off the CURRENT real price, never off
     # the previous boosted price. That keeps the simulation anchored to
     # reality — one wild tick can't permanently drag the series away.
@@ -224,7 +251,7 @@ def get_boosted_price(coin):
     if len(history) > _MAX_HISTORY:
         history.pop(0)
 
-    return {
+    snapshot = {
         "coin": coin,
         "real_price": real_price,
         "real_change_pct": real_change_pct,
@@ -232,6 +259,11 @@ def get_boosted_price(coin):
         "boosted_change_pct": boosted_change_pct,
         "timestamp": timestamp,
     }
+    # Remember this tick so callers within BOOSTED_TICK_SECONDS reuse it. Note we
+    # only reach here (and only append to history) when computing a FRESH tick, so
+    # the chart never fills with duplicated cached points.
+    _boosted_cache[coin] = snapshot
+    return dict(snapshot)                     # copy so callers can't mutate the cache
 
 
 def get_price_history(coin, limit=50):

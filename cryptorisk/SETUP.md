@@ -147,17 +147,16 @@ db.close()
 
 Should print `[('portfolio',), ('transactions',), ('users',)]`. If this fails, see Troubleshooting below.
 
-> **Backend-only for now?** Steps 5 and 6 (the database) are only needed to run the *real* database layer. Member 1 can build and test the entire `backend/` without MySQL at all — it runs against an in-memory stub. See the next section.
+> **Note:** `trade_engine.py` writes to the real MySQL database, so Steps 5 and 6 are required to run its self-test. `price_engine.py` and `news_engine.py` still run without MySQL.
 
 ---
 
 ## Backend setup & how to run it (Member 1)
 
-The `backend/` folder (`price_engine.py`, `trade_engine.py`, `news_engine.py`)
-does **not** need MySQL, a `.env`, or the frontend to run and be tested. It
-only needs the Python packages from Step 2 (`numpy`, `requests`). Until
-Member 2's real `db/` package exists, `trade_engine.py` automatically falls
-back to `backend/db_stub.py`, an in-memory fake database.
+`price_engine.py` and `news_engine.py` need only the Python packages from
+Step 2 (`numpy`, `requests`) — no MySQL, `.env`, or frontend. `trade_engine.py`
+uses Member 2's real `db/` package, so it additionally needs MySQL set up
+(Steps 3–6) with a user having `userid` 1 in the `users` table.
 
 ### One-time setup
 
@@ -175,14 +174,11 @@ venv's Python and the `-m` flag (so the `backend.` imports resolve):
 # Live prices from CoinGecko + the boosted/volatility engine
 ./venv/bin/python -m backend.price_engine
 
-# Full buy/sell cycle against the stub database (rejections + a buy/buy/sell)
+# Full buy/sell cycle against the real MySQL database (rejections + a buy/buy/sell)
 ./venv/bin/python -m backend.trade_engine
 
 # Fake-news generator + the 3-call price-impact decay
 ./venv/bin/python -m backend.news_engine
-
-# The in-memory stub database on its own
-./venv/bin/python -m backend.db_stub
 ```
 
 Prefer activating the venv once? Then plain `python` works:
@@ -205,15 +201,6 @@ python -m backend.price_engine
 If `price_engine` prints `CoinGecko fetch failed: ...`, your machine can't
 reach the API right now (offline / rate-limited) — the code handles it
 gracefully; just retry in a moment.
-
-### When Member 2 delivers the real `db/`
-
-1. Do Steps 3–6 above (create `.env`, run `schema.sql`, smoke-test the
-   MySQL connection).
-2. Delete `backend/db_stub.py`.
-3. Re-run `./venv/bin/python -m backend.trade_engine` — it now writes to the
-   real MySQL database instead of the stub. (Member 2 also needs to add
-   `get_user_by_id(userid)` to `db/users_db.py` — see `BACKEND_GUIDE.md`.)
 
 ---
 

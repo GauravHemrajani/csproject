@@ -12,33 +12,15 @@ from price_engine.get_boosted_price(), never the real CoinGecko price.
 All signatures here are locked in INTERFACES.md.
 """
 
+import math
 from datetime import date
 
 from backend.price_engine import SUPPORTED_COINS, get_boosted_price
 
-# ---------------------------------------------------------------------------
-# Database imports.
-# We try to import Member 2's real db/ package first. Until they've delivered
-# it, that import fails and we fall back to the in-memory stubs in db_stub.py.
-# Because both expose the SAME function names, nothing below this block has to
-# change when the real database arrives — the import just switches over.
-#
-# NOTE: get_user_by_id(userid) is a small addition we need from Member 2.
-# INTERFACES.md only has get_user(username), but execute_trade() is given a
-# userid, so we need to look a user up by id. Flagged for the team.
-# ---------------------------------------------------------------------------
-try:
-    from db.users_db import get_user_by_id, update_balance
-    from db.portfolio_db import get_portfolio, upsert_holding
-    from db.transactions_db import insert_transaction
-except ImportError:
-    from backend.db_stub import (
-        get_user_by_id,
-        update_balance,
-        get_portfolio,
-        upsert_holding,
-        insert_transaction,
-    )
+from db.connection import get_connection
+from db.users_db import get_user_by_id, update_balance
+from db.portfolio_db import get_portfolio, upsert_holding
+from db.transactions_db import insert_transaction
 
 
 def calculate_weighted_avg_buy_price(existing_qty, existing_avg_price, new_qty, new_price):
@@ -70,6 +52,12 @@ def execute_trade(userid, coin, action, quantity):
         return _fail("Invalid action — must be BUY or SELL")
     if coin not in SUPPORTED_COINS:
         return _fail("Invalid coin")
+    # Reject non-numeric quantities (str, None, ...) and non-finite ones (NaN, inf)
+    # before any comparison — NaN in particular compares False to everything
+    # (NaN <= 0, cost > balance, etc.), so it would otherwise slip past every
+    # check below and corrupt the balance/holding with NaN.
+    if isinstance(quantity, bool) or not isinstance(quantity, (int, float)) or not math.isfinite(quantity):
+        return _fail("Quantity must be a valid number")
     if quantity <= 0:
         return _fail("Quantity must be greater than 0")
 
@@ -80,59 +68,98 @@ def execute_trade(userid, coin, action, quantity):
     if snapshot is None:
         return _fail("Price temporarily unavailable — try again in a moment")
     price = snapshot["boosted_price"]        # trade executes at the boosted price
+    # Defense in depth: price_engine floors the boosted change so this should never
+    # happen, but never trade against a non-positive price — a negative price would
+    # make cost negative and let a BUY ADD cash instead of spending it.
+    if price <= 0:
+        return _fail("Price temporarily unavailable — try again in a moment")
 
-    # --- Look up the user's current balance ---
-    user = get_user_by_id(userid)
-    if user is None:
-        return _fail("User not found")
-    balance = user["balance"]
+    # --- Open the trade's ONE connection and lock the user's row ---
+    # Everything below — the balance read, the holding read, and the three
+    # writes — runs on this single connection as one transaction. The balance
+    # is read with FOR UPDATE, which locks this user's row until commit(): a
+    # second trade fired at the same instant (double-click, second tab) waits
+    # at its own locked read instead of seeing the stale balance, so two trades
+    # can never both spend the same money. All writes then commit together at
+    # the very end (all-or-nothing): if anything fails mid-trade, rollback
+    # discards every uncommitted write. Uses only conn.commit()/conn.rollback()
+    # from mysql.connector (the same API every db/ function already uses) — no
+    # SQL transaction statements, so the CBSE constraint in the summary holds.
+    conn = get_connection()
+    if conn is None:
+        return _fail("Database error — could not connect")
+    try:
+        # --- Look up (and lock) the user's current balance ---
+        user = get_user_by_id(userid, conn=conn, for_update=True)
+        if user is None:
+            conn.rollback()
+            return _fail("User not found")
+        balance = user["balance"]
 
-    # --- Find the user's current holding of THIS coin, if any ---
-    holding = None
-    for row in get_portfolio(userid):
-        if row["coin"] == coin:
-            holding = row
-            break
+        # --- Find the user's current holding of THIS coin, if any ---
+        holding = None
+        for row in get_portfolio(userid, conn=conn):
+            if row["coin"] == coin:
+                holding = row
+                break
 
-    if action == "BUY":
-        cost = quantity * price
-        if cost > balance:
-            return _fail("Insufficient balance")
-        new_balance = balance - cost
-        # New holding total + recalculated average buy price.
-        if holding is None:
-            new_qty = quantity               # first time buying this coin
-            new_avg_price = price
-        else:
-            new_qty = holding["quantity"] + quantity
-            new_avg_price = calculate_weighted_avg_buy_price(
-                holding["quantity"], holding["buy_price"], quantity, price
-            )
-    else:  # SELL
-        owned = holding["quantity"] if holding else 0.0
-        if quantity > owned:
-            return _fail("Insufficient quantity owned")
-        new_balance = balance + (quantity * price)   # selling adds cash
-        new_qty = owned - quantity           # could be 0 (full sell-out)
-        # Floating-point subtraction can leave microscopic dust (e.g. 5e-17)
-        # instead of a clean 0, which would leave a phantom near-zero holding.
-        # Snap that to 0 so upsert_holding() deletes the row on a full sell.
-        if new_qty < 1e-9:
-            new_qty = 0.0
-        new_avg_price = holding["buy_price"] # average is unchanged on a sell
+        if action == "BUY":
+            cost = quantity * price
+            if cost > balance:
+                conn.rollback()
+                return _fail("Insufficient balance")
+            # Round cash to whole cents so binary-float dust can't accumulate in
+            # the balance over many trades. (Coin QUANTITIES stay full precision;
+            # only the dollars-and-cents cash figure is snapped.)
+            new_balance = round(balance - cost, 2)
+            # New holding total + recalculated average buy price.
+            if holding is None:
+                new_qty = quantity               # first time buying this coin
+                new_avg_price = price
+            else:
+                new_qty = holding["quantity"] + quantity
+                new_avg_price = calculate_weighted_avg_buy_price(
+                    holding["quantity"], holding["buy_price"], quantity, price
+                )
+        else:  # SELL
+            owned = holding["quantity"] if holding else 0.0
+            if quantity > owned:
+                conn.rollback()
+                return _fail("Insufficient quantity owned")
+            new_balance = round(balance + (quantity * price), 2)   # selling adds cash (cents)
+            new_qty = owned - quantity           # could be 0 (full sell-out)
+            # Floating-point subtraction can leave microscopic dust (e.g. 5e-17)
+            # instead of a clean 0, which would leave a phantom near-zero holding.
+            # Snap that to 0 so upsert_holding() deletes the row on a full sell.
+            if new_qty < 1e-9:
+                new_qty = 0.0
+            new_avg_price = holding["buy_price"] # average is unchanged on a sell
 
-    # --- Commit the three database writes ---
-    # 1) new cash balance
-    if not update_balance(userid, new_balance):
-        return _fail("Database error while updating balance")
-    # 2) new holding. upsert_holding() deletes the row itself if new_qty <= 0,
-    #    so a full sell-out needs no separate delete call from us.
-    if not upsert_holding(userid, coin, new_qty, new_avg_price):
-        return _fail("Database error while updating portfolio")
-    # 3) transaction log entry (trade_date is a real date object — MySQL
-    #    stores it as a native DATE, no string formatting needed).
-    if insert_transaction(userid, coin, action, quantity, price, date.today()) is None:
-        return _fail("Database error while recording transaction")
+        # --- The three writes, committed together ---
+        # 1) new cash balance
+        if not update_balance(userid, new_balance, conn=conn):
+            conn.rollback()
+            return _fail("Database error while updating balance")
+        # 2) new holding. upsert_holding() deletes the row itself if new_qty <= 0,
+        #    so a full sell-out needs no separate delete call from us.
+        if not upsert_holding(userid, coin, new_qty, new_avg_price, conn=conn):
+            conn.rollback()
+            return _fail("Database error while updating portfolio")
+        # 3) transaction log entry (trade_date is a real date object — MySQL
+        #    stores it as a native DATE, no string formatting needed).
+        if insert_transaction(userid, coin, action, quantity, price, date.today(), conn=conn) is None:
+            conn.rollback()
+            return _fail("Database error while recording transaction")
+        conn.commit()
+    except Exception as e:
+        print("execute_trade transaction failed:", e)
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        return _fail("Database error during trade")
+    finally:
+        conn.close()
 
     return {
         "success": True,
@@ -144,7 +171,7 @@ def execute_trade(userid, coin, action, quantity):
 
 # ---------------------------------------------------------------------------
 # Standalone smoke test. Run with:  python -m backend.trade_engine
-# Runs against the in-memory stub database (test user: userid 1, $10,000).
+# Runs against the real MySQL database (needs a user with userid 1).
 # Exercises every rejection case plus a full buy/buy/sell cycle.
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
@@ -160,7 +187,7 @@ if __name__ == "__main__":
     print("\nSell 0.10 BTC (full):", execute_trade(1, "BTC", "SELL", 0.10))
     print("Portfolio after full sell:", get_portfolio(1))
 
-    from backend.db_stub import get_transaction_history
+    from db.transactions_db import get_transaction_history
     print("\nHistory:")
     for t in get_transaction_history(1):
         print(" ", t)

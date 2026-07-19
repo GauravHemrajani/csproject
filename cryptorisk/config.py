@@ -37,7 +37,7 @@ _env = _load_env()
 # --- MySQL connection settings (used by db/connection.py -> get_connection()) ---
 DB_HOST = _env.get("DB_HOST", "localhost")
 DB_USER = _env.get("DB_USER", "root")
-DB_PASSWORD = _env.get("DB_PASSWORD", "")
+DB_PASSWORD = _env.get("DB_PASSWORD", '"pass"gv')
 DB_NAME = _env.get("DB_NAME", "cryptorisk")
 
 # --- CoinGecko API settings (used by backend/price_engine.py) ---

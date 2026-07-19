@@ -49,7 +49,7 @@ Real price changes are artificially amplified to create a fast, high-volatility 
 boosted_change = (real_change * 5) + np.random.normal(0, 3) + news_impact
 ```
 
-Example: a real BTC change of +2% might become a simulated +14% (before any news impact). The `news_impact` term is not cosmetic — active fake news events actively nudge this value. **This formula is summarized here for context; `INTERFACES.md` is the authoritative, locked spec** for the exact function signature (`get_boosted_price()`) and field names.
+Example: a real BTC change of +2% might become a simulated +14% (before any news impact). The `news_impact` term is not cosmetic — active fake news events actively nudge this value. The resulting % change is floor-clamped at -95% so the simulated price can never hit zero or go negative. **This formula is summarized here for context; `INTERFACES.md` is the authoritative, locked spec** for the exact function signature (`get_boosted_price()`) and field names.
 
 ## MVP Feature Scope
 
